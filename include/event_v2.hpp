@@ -9,7 +9,9 @@
 #include<memory>
 #include<algorithm>
 
-namespace rpt::detail {
+#include <cassert>
+
+namespace rpt::event_detail {
 
 #if __cpp_lib_atomic_shared_ptr
     struct has_std_atomic_shared_ptr : std::true_type {};
@@ -62,26 +64,30 @@ namespace rpt::detail {
     */
     template<typename T, typename U = void>
     struct atomic_shared_array {
-        class type {
+        class detail {
         public:
-            std::shared_ptr<T[]> load();
+            std::shared_ptr<T[]> load(std::memory_order order = std::memory_order_seq_cst) noexcept { return std::atomic_load_explicit(&data, order); }
 
-            void store();
+            void store(std::shared_ptr<T[]> desired, std::memory_order order = std::memory_order_seq_cst) noexcept
+            { return std::atomic_store_explicit(&data, desired, order); }
 
-            bool compare_exchange_strong(std::shared_ptr<T>& expected, std::shared_ptr<T> desired,
-                std::memory_order order = std::memory_order_seq_cst) noexcept;
+            bool compare_exchange_strong(std::shared_ptr<T[]>& expected, std::shared_ptr<T[]> desired,
+                std::memory_order order = std::memory_order_seq_cst) noexcept
+            { return atomic_compare_exchange_strong_explicit (&data, &expected, desired, order, order); }
+
         private:
             std::shared_ptr<T[]> data;
         };
+        using type = detail;
     };
 
-    template<typename T>
-    struct atomic_shared_array<T> :
-        std::enable_if<has_std_atomic_shared_ptr::value,
-            std::atomic<
-                std::shared_ptr<
-                    T[]
-        >>>{};
+    //template<typename T>
+    //struct atomic_shared_array<T> :
+    //    std::enable_if<has_std_atomic_shared_ptr::value,
+    //        std::atomic<
+    //            std::shared_ptr<
+    //                T[]
+    //    >>>{};
 
     template<typename T>
     using atomic_shared_array_t = typename atomic_shared_array<T>::type;
@@ -151,9 +157,13 @@ namespace rpt::detail {
     template<typename T>
     typename array_generator<T>::array_type array_generator<T>::copy_remove(const typename array_generator<T>::array_type& arr, std::remove_pointer_t<T>& t) const {
         auto size = get_size(arr) - 1;
-        auto output = make_array_for_overwrite(size, get_generation(arr) + 1);
-        std::remove_copy(get_data(arr), std::next(get_data(arr),size + 1), get_data(output), &t);
-        return output;
+        if (size != 0)
+        {
+            auto output = make_array_for_overwrite(size, get_generation(arr) + 1);
+            std::remove_copy(get_data(arr), std::next(get_data(arr), size + 1), get_data(output), &t);
+            return output;
+        }
+        return nullptr;
     }
 
     template<typename T>
@@ -214,23 +224,23 @@ namespace rpt::detail {
         {
             using iterator_category = std::forward_iterator_tag;
             using difference_type = std::ptrdiff_t;
-            using value_type = std::remove_reference_t<T>;
-            using pointer = std::remove_reference_t<T>*;
-            using reference = std::remove_reference_t<T>&;
+            using value_type = T;
+            using pointer = T*;
+            using reference = T&;
 
-            iterator(pointer ptr) : ptr(ptr) {}
+            iterator(pointer* ptr) : ptr(ptr) {}
 
             //iterator(iterator it) : ptr(it.ptr) {}
 
-            reference operator*() const { return *ptr; }
-            pointer operator->() { return ptr; }
+            reference operator*() const { return **ptr; }
+            pointer operator->() { return (*ptr); }
             iterator& operator++() { ptr++; return *this; }
-            //iterator operator++(T) { iterator tmp = *this; ++(*this); return tmp; }
+            iterator operator++(int) { iterator tmp = *this; ++(*this); return tmp; }
             friend bool operator== (const iterator& a, const iterator& b) { return a.ptr == b.ptr; };
             friend bool operator!= (const iterator& a, const iterator& b) { return a.ptr != b.ptr; };
 
         private:
-            pointer ptr;
+            pointer* ptr;
         };
 
         array_viewer(std::shared_ptr<entry_type[]>&&, std::size_t);
@@ -267,7 +277,7 @@ namespace rpt::detail {
 
     template<typename T>
     typename array_viewer<T>::iterator array_viewer<T>::end() {
-        return iterator{ std::next(arr.get(), size) };
+        return iterator{ std::next(arr.get(), sz) };
     }
 
     template<typename T>
@@ -275,10 +285,159 @@ namespace rpt::detail {
         return sz;
     }
 
+    /*
+        Technically needed because the lifetime of the event class ends
+        when the destructor is called and would lead to UB if an attempt
+        to unsubscribe was made mid destruction.
+
+        The solution is to handle all the un-subscribing in event and then 
+        call the implicit destructor of event_base after there are no more 
+        references being held by listeners
+    */
+    template<typename... Params>
+    struct event_base {
+        using array_type = std::shared_ptr<listener_base<Params...>* []>;
+
+        /*
+            Method to call from listener base in order to remove the litener from the array.
+        */
+        void repudiate(listener_base<Params...>&);
+
+        /*
+            get a copy of hte list that cannot be detructed while the shared pointer (array_type) is held.
+        */
+        array_type lock();
+
+        /*
+            Add a listener to the list of subscribers
+            from the start of this function call the lisener may be invoked.
+        */
+        void subscribe(listener_base<Params...>&);
+
+        /*
+            Clear the list and wait for it to be safe to destruct event_base
+        */
+        void clear();
+
+    private:
+        using atomic_array_type = atomic_shared_array_t<listener_base<Params...>*>;
+
+        array_generator<listener_base<Params...>*> generator;
+
+        std::atomic_uintptr_t free_generation{ 0 };
+        atomic_array_type data{};
+    };
+
+    template<typename... Params>
+    void event_base<Params...>::repudiate(listener_base<Params...>& l) {
+        auto holder = lock();
+        assert(holder);
+        auto next = generator.copy_remove(holder, l);
+        while (!data.compare_exchange_strong(holder, next))
+        {
+            next = generator.copy_remove(holder, l);
+        }
+    }
+
+    template<typename... Params>
+    typename event_base<Params...>::array_type event_base<Params...>::lock() {
+        return data.load();
+    }
+
+    template<typename... Params>
+    void event_base<Params...>::subscribe(listener_base<Params...>& l) {
+        auto holder = lock();
+        auto next = holder ? generator.copy_push_back(holder, l) : generator.make_array(l);
+        while (!data.compare_exchange_strong(holder, next))
+        {
+            next = holder ? generator.copy_push_back(holder, l) : generator.make_array(l);
+        }
+    }
+
+    template<typename... Params>
+    void event_base<Params...>::clear() {
+
+    }
 }
 
-namespace rpt::event {
+namespace rpt {
 
+    template<typename... Params>
+    class event;
+
+    template<typename Callback, typename... Params>
+    class listener : event_detail::listener_base<Params...> {
+    public:
+        template<typename CB>
+        listener(event<Params...>&, CB&&);
+
+        listener() = delete;
+        listener(const listener&) = delete;
+        listener(listener&&) = delete;
+        listener& operator= (const listener&) = delete;
+        listener& operator= (listener&&) = delete;
+
+        ~listener();
+    private:
+        using base_type = typename event_detail::listener_base<Params...>;
+        using event_base_type = typename event_detail::event_base<Params...>;
+        using repudiate_fn_type = void(*)(event_base_type&, base_type&);
+
+        event_base_type const & event_ref; 
+        std::atomic<repudiate_fn_type> repudiate_fn;
+        Callback cb;
+    };
+
+    template<typename Callback, typename... Params>
+    template<typename CB>
+    listener<Callback, Params...>::listener(event<Params...>&, CB&&)
+        : base_type{
+            [](base_type& l, Params... params) {
+        static_cast<listener<Callback, Params...>&>(l).cb(params...);
+    }}
+    {
+
+    }
+
+    template<typename Callback, typename... Params>
+    listener<Callback, Params...>::~listener() {
+        if (auto stash = repudiate_fn.exchange(nullptr)) {
+
+        }
+        else {
+            stash(event_ref, *this);
+        }
+    }
+
+    template<typename... Params>
+    class event : event_detail::event_base<Params...>{
+    public:
+        event();
+        event(const event&) = delete;
+        event(event&&) = delete;
+        event& operator=(const event&) = delete;
+        event& operator=(event&&) = delete;
+
+        template<typename... Args>
+        void operator()(Args&&...);
+
+        template<typename Callback>
+        listener<Callback> subscribe(Callback&&);
+    };
+
+    template<typename... Params>
+    template<typename... Args>
+    void event<Params...>::operator()(Args&&...)
+    {
+
+    }
+
+    template<typename... Params>
+    template<typename Callback>
+    listener<Callback> event<Params...>::subscribe(Callback&& cb)
+    {
+        return listener<Callback>(*this, std::move(cb));
+    }
 }
 
 #endif //RPT_EVENT
