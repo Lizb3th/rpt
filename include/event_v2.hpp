@@ -45,11 +45,16 @@ namespace rpt::event_detail {
     template<typename... Params>
     struct listener_base {
         using callback_ref_type = void(*)(listener_base&, Params...);
+        using detach_type = bool(*)(listener_base&);
 
         callback_ref_type _callback;
 
+        detach_type _detatch;
+
         template<typename... Args>
         void operator()(Args...);
+
+        bool detatch();
     };
 
     template<typename... Params>
@@ -58,6 +63,10 @@ namespace rpt::event_detail {
         _callback(*this, Params(std::move(args))...);
     }
 
+    template<typename... Params>
+    bool listener_base<Params...>::detatch() {
+        return _detatch(*this);
+    }
 
     /*
     *   listener_shared_array
@@ -356,7 +365,8 @@ namespace rpt::event_detail {
 
     template<typename... Params>
     void event_base<Params...>::clear() {
-
+        auto holder = lock();
+        
     }
 }
 
@@ -393,8 +403,11 @@ namespace rpt {
     listener<Callback, Params...>::listener(event<Params...>&, CB&&)
         : base_type{
             [](base_type& l, Params... params) {
-        static_cast<listener<Callback, Params...>&>(l).cb(params...);
-    }}
+                static_cast<listener<Callback, Params...>&>(l).cb(params...);
+            },
+            [](base_type& l)
+                return static_cast<listener<Callback, Params...>&>(l).repudiate_fn.exchange(nullptr) != nullptr;
+            }
     {
 
     }
